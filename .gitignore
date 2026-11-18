@@ -1,0 +1,9 @@
+*.o
+*.elf
+*.iso
+*.img
+*.bin
+*.log
+backup/
+integration/
+iso/boot/kernel.elf
