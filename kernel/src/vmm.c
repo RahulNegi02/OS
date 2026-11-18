@@ -1,0 +1,636 @@
+#include <stdint.h>
+#include <stdbool.h>
+
+#include "vmm.h"
+#include "pmm.h"
+
+// Hardware page-table entry flags.
+#define PAGE_PRESENT       (1ULL << 0)
+#define PAGE_WRITABLE      (1ULL << 1)
+#define PAGE_USER          (1ULL << 2)
+#define PAGE_HUGE          (1ULL << 7)
+
+#define PAGE_ADDRESS_MASK  0x000FFFFFFFFFF000ULL
+#define PAGE_2MB_MASK      0x000FFFFFFFE00000ULL
+#define PAGE_1GB_MASK      0x000FFFFFC0000000ULL
+#define PAGE_NO_EXECUTE    (1ULL << 63)
+
+#define CPUID_EXT_MAX      0x80000000U
+#define CPUID_EXT_FEATURES 0x80000001U
+#define CPUID_NX_BIT       (1U << 20)
+
+#define MSR_EFER           0xC0000080U
+#define EFER_NXE           (1ULL << 11)
+
+#define OFFSET_4KB         0xFFFULL
+#define OFFSET_2MB         0x1FFFFFULL
+#define OFFSET_1GB         0x3FFFFFFFULL
+
+static bool nx_enabled = false;
+
+
+// Read the current page-table root address from CR3.
+static uint64_t read_cr3(void)
+{
+    uint64_t value;
+
+    __asm__ volatile (
+        "mov %%cr3, %0"
+        : "=r"(value)
+    );
+
+    return value;
+}
+
+
+// Enable the CPU's No-Execute (NX) page protection feature.
+bool vmm_enable_nx(void)
+{
+    uint32_t eax, ebx, ecx, edx;
+
+    __asm__ volatile (
+        "cpuid"
+        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+        : "a"(CPUID_EXT_MAX), "c"(0)
+    );
+
+    if (eax < CPUID_EXT_FEATURES) {
+        return false;
+    }
+
+    __asm__ volatile (
+        "cpuid"
+        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+        : "a"(CPUID_EXT_FEATURES), "c"(0)
+    );
+
+    if ((edx & CPUID_NX_BIT) == 0) {
+        return false;
+    }
+
+    uint32_t efer_low, efer_high;
+
+    __asm__ volatile (
+        "rdmsr"
+        : "=a"(efer_low), "=d"(efer_high)
+        : "c"(MSR_EFER)
+    );
+
+    uint64_t efer =
+        ((uint64_t)efer_high << 32) | efer_low;
+
+    efer |= EFER_NXE;
+
+    __asm__ volatile (
+        "wrmsr"
+        :
+        : "c"(MSR_EFER),
+          "a"((uint32_t)efer),
+          "d"((uint32_t)(efer >> 32))
+        : "memory"
+    );
+
+    nx_enabled = true;
+
+    return true;
+}
+
+
+// Check whether an address is canonical for four-level paging.
+static bool is_canonical(uint64_t address)
+{
+    uint64_t upper = address >> 48;
+    bool sign_bit = ((address >> 47) & 1) != 0;
+
+    if (sign_bit) {
+        return upper == 0xFFFF;
+    }
+
+    return upper == 0;
+}
+
+
+// Convert a physical address to its HHDM virtual address.
+static volatile uint64_t *physical_to_virtual(
+    uint64_t physical_address,
+    uint64_t hhdm_offset
+)
+{
+    return (volatile uint64_t *)(uintptr_t)(
+        hhdm_offset + physical_address
+    );
+}
+
+
+// Clear a newly allocated page-table frame.
+static void zero_page(
+    uint64_t physical_address,
+    uint64_t hhdm_offset
+)
+{
+    volatile uint64_t *page =
+        physical_to_virtual(physical_address, hhdm_offset);
+
+    for (uint64_t i = 0;
+         i < PMM_PAGE_SIZE / sizeof(uint64_t);
+         i++) {
+        page[i] = 0;
+    }
+}
+
+
+// Get an existing child table or allocate a new one.
+static bool get_or_create_table(
+    volatile uint64_t *parent,
+    uint64_t index,
+    uint64_t hhdm_offset,
+    bool user,
+    volatile uint64_t **result,
+    bool *created,
+    uint64_t *created_frame
+)
+{
+    *created = false;
+    *created_frame = 0;
+
+    uint64_t entry = parent[index];
+
+    if (entry & PAGE_PRESENT) {
+        if (entry & PAGE_HUGE) {
+            return false;
+        }
+
+        if (user && !(entry & PAGE_USER)) {
+            parent[index] = entry | PAGE_USER;
+        }
+
+        *result = physical_to_virtual(
+            entry & PAGE_ADDRESS_MASK,
+            hhdm_offset
+        );
+
+        return true;
+    }
+
+    uint64_t new_frame = pmm_alloc_frame();
+
+    if (new_frame == 0) {
+        return false;
+    }
+
+    zero_page(new_frame, hhdm_offset);
+
+    uint64_t new_entry =
+        new_frame | PAGE_PRESENT | PAGE_WRITABLE;
+
+    if (user) {
+        new_entry |= PAGE_USER;
+    }
+
+    parent[index] = new_entry;
+
+    *result = physical_to_virtual(new_frame, hhdm_offset);
+    *created = true;
+    *created_frame = new_frame;
+
+    return true;
+}
+
+
+// Return true only when a page table contains no present entries.
+static bool page_table_is_empty(volatile uint64_t *table)
+{
+    for (uint64_t i = 0; i < 512; i++) {
+        if (table[i] & PAGE_PRESENT) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+
+// Remove and free a table only if it is empty and its parent
+// entry still points to the expected physical frame.
+static void rollback_table(
+    volatile uint64_t *parent,
+    uint64_t index,
+    uint64_t frame,
+    uint64_t hhdm_offset
+)
+{
+    if (frame == 0) {
+        return;
+    }
+
+    uint64_t entry = parent[index];
+
+    if (!(entry & PAGE_PRESENT) ||
+        (entry & PAGE_ADDRESS_MASK) != frame) {
+        return;
+    }
+
+    volatile uint64_t *table =
+        physical_to_virtual(frame, hhdm_offset);
+
+    if (!page_table_is_empty(table)) {
+        return;
+    }
+
+    // Disconnect the table before returning its frame to the PMM.
+    parent[index] = 0;
+
+    pmm_free_frame(frame);
+}
+
+
+// Translate a virtual address to a physical address.
+// Supports 4 KiB, 2 MiB, and 1 GiB pages.
+bool vmm_translate(
+    uint64_t virtual_address,
+    uint64_t hhdm_offset,
+    uint64_t *physical_address
+)
+{
+    if (physical_address == 0 ||
+        !is_canonical(virtual_address)) {
+        return false;
+    }
+
+    uint64_t pml4_index = (virtual_address >> 39) & 0x1FF;
+    uint64_t pdpt_index = (virtual_address >> 30) & 0x1FF;
+    uint64_t pd_index   = (virtual_address >> 21) & 0x1FF;
+    uint64_t pt_index   = (virtual_address >> 12) & 0x1FF;
+
+    uint64_t pml4_physical =
+        read_cr3() & PAGE_ADDRESS_MASK;
+
+    volatile uint64_t *pml4 =
+        physical_to_virtual(pml4_physical, hhdm_offset);
+
+    uint64_t pml4_entry = pml4[pml4_index];
+
+    if (!(pml4_entry & PAGE_PRESENT)) {
+        return false;
+    }
+
+    volatile uint64_t *pdpt = physical_to_virtual(
+        pml4_entry & PAGE_ADDRESS_MASK,
+        hhdm_offset
+    );
+
+    uint64_t pdpt_entry = pdpt[pdpt_index];
+
+    if (!(pdpt_entry & PAGE_PRESENT)) {
+        return false;
+    }
+
+    // A huge page at this level maps 1 GiB.
+    if (pdpt_entry & PAGE_HUGE) {
+        *physical_address =
+            (pdpt_entry & PAGE_1GB_MASK)
+            | (virtual_address & OFFSET_1GB);
+
+        return true;
+    }
+
+    volatile uint64_t *pd = physical_to_virtual(
+        pdpt_entry & PAGE_ADDRESS_MASK,
+        hhdm_offset
+    );
+
+    uint64_t pd_entry = pd[pd_index];
+
+    if (!(pd_entry & PAGE_PRESENT)) {
+        return false;
+    }
+
+    // A huge page at this level maps 2 MiB.
+    if (pd_entry & PAGE_HUGE) {
+        *physical_address =
+            (pd_entry & PAGE_2MB_MASK)
+            | (virtual_address & OFFSET_2MB);
+
+        return true;
+    }
+
+    volatile uint64_t *pt = physical_to_virtual(
+        pd_entry & PAGE_ADDRESS_MASK,
+        hhdm_offset
+    );
+
+    uint64_t pt_entry = pt[pt_index];
+
+    if (!(pt_entry & PAGE_PRESENT)) {
+        return false;
+    }
+
+    *physical_address =
+        (pt_entry & PAGE_ADDRESS_MASK)
+        | (virtual_address & OFFSET_4KB);
+
+    return true;
+}
+
+
+// Map a 4 KiB page with specified permissions.
+bool vmm_map_page_flags(
+    uint64_t virtual_address,
+    uint64_t physical_address,
+    uint64_t hhdm_offset,
+    uint64_t flags
+)
+{
+    const uint64_t allowed_flags =
+        VMM_READ | VMM_WRITE | VMM_USER | VMM_NO_EXEC;
+
+    if ((flags & ~allowed_flags) != 0 ||
+        !(flags & VMM_READ) ||
+        !is_canonical(virtual_address) ||
+        (virtual_address & OFFSET_4KB) != 0 ||
+        (physical_address & OFFSET_4KB) != 0 ||
+        (physical_address & ~PAGE_ADDRESS_MASK) != 0) {
+        return false;
+    }
+
+    if ((flags & VMM_NO_EXEC) && !nx_enabled) {
+        return false;
+    }
+
+    uint64_t pml4_index = (virtual_address >> 39) & 0x1FF;
+    uint64_t pdpt_index = (virtual_address >> 30) & 0x1FF;
+    uint64_t pd_index   = (virtual_address >> 21) & 0x1FF;
+    uint64_t pt_index   = (virtual_address >> 12) & 0x1FF;
+
+    bool user = (flags & VMM_USER) != 0;
+
+    volatile uint64_t *pml4 = physical_to_virtual(
+        read_cr3() & PAGE_ADDRESS_MASK,
+        hhdm_offset
+    );
+
+    volatile uint64_t *pdpt;
+    volatile uint64_t *pd;
+    volatile uint64_t *pt;
+
+    bool pdpt_created;
+    uint64_t pdpt_frame;
+
+    if (!get_or_create_table(
+            pml4,
+            pml4_index,
+            hhdm_offset,
+            user,
+            &pdpt,
+            &pdpt_created,
+            &pdpt_frame)) {
+        return false;
+    }
+
+    bool pd_created;
+    uint64_t pd_frame;
+
+    if (!get_or_create_table(
+            pdpt,
+            pdpt_index,
+            hhdm_offset,
+            user,
+            &pd,
+            &pd_created,
+            &pd_frame)) {
+
+        if (pdpt_created) {
+            rollback_table(
+                pml4,
+                pml4_index,
+                pdpt_frame,
+                hhdm_offset
+            );
+        }
+
+        return false;
+    }
+
+    bool pt_created;
+    uint64_t pt_frame;
+
+    if (!get_or_create_table(
+            pd,
+            pd_index,
+            hhdm_offset,
+            user,
+            &pt,
+            &pt_created,
+            &pt_frame)) {
+
+        if (pd_created) {
+            rollback_table(
+                pdpt,
+                pdpt_index,
+                pd_frame,
+                hhdm_offset
+            );
+        }
+
+        if (pdpt_created) {
+            rollback_table(
+                pml4,
+                pml4_index,
+                pdpt_frame,
+                hhdm_offset
+            );
+        }
+
+        return false;
+    }
+
+    // Never overwrite an existing mapping.
+    if (pt[pt_index] & PAGE_PRESENT) {
+        if (pt_created) {
+            rollback_table(
+                pd,
+                pd_index,
+                pt_frame,
+                hhdm_offset
+            );
+        }
+
+        if (pd_created) {
+            rollback_table(
+                pdpt,
+                pdpt_index,
+                pd_frame,
+                hhdm_offset
+            );
+        }
+
+        if (pdpt_created) {
+            rollback_table(
+                pml4,
+                pml4_index,
+                pdpt_frame,
+                hhdm_offset
+            );
+        }
+
+        return false;
+    }
+
+    uint64_t entry = physical_address | PAGE_PRESENT;
+
+    if (flags & VMM_WRITE) {
+        entry |= PAGE_WRITABLE;
+    }
+
+    if (user) {
+        entry |= PAGE_USER;
+    }
+
+    if (flags & VMM_NO_EXEC) {
+        entry |= PAGE_NO_EXECUTE;
+    }
+
+    pt[pt_index] = entry;
+
+    __asm__ volatile (
+        "invlpg (%0)"
+        :
+        : "r"(virtual_address)
+        : "memory"
+    );
+
+    return true;
+}
+
+
+// Map a 4 KiB page with default read/write permissions.
+bool vmm_map_page(
+    uint64_t virtual_address,
+    uint64_t physical_address,
+    uint64_t hhdm_offset
+)
+{
+    return vmm_map_page_flags(
+        virtual_address,
+        physical_address,
+        hhdm_offset,
+        VMM_READ | VMM_WRITE
+    );
+}
+
+
+// Remove a 4 KiB mapping and return its physical frame.
+// The physical frame is NOT freed by this function.
+bool vmm_unmap_page(
+    uint64_t virtual_address,
+    uint64_t hhdm_offset,
+    uint64_t *physical_address
+)
+{
+    if (physical_address == 0 ||
+        !is_canonical(virtual_address) ||
+        (virtual_address & OFFSET_4KB) != 0) {
+        return false;
+    }
+
+    uint64_t pml4_index = (virtual_address >> 39) & 0x1FF;
+    uint64_t pdpt_index = (virtual_address >> 30) & 0x1FF;
+    uint64_t pd_index   = (virtual_address >> 21) & 0x1FF;
+    uint64_t pt_index   = (virtual_address >> 12) & 0x1FF;
+
+    volatile uint64_t *pml4 = physical_to_virtual(
+        read_cr3() & PAGE_ADDRESS_MASK,
+        hhdm_offset
+    );
+
+    uint64_t pml4_entry = pml4[pml4_index];
+
+    if (!(pml4_entry & PAGE_PRESENT)) {
+        return false;
+    }
+
+    volatile uint64_t *pdpt = physical_to_virtual(
+        pml4_entry & PAGE_ADDRESS_MASK,
+        hhdm_offset
+    );
+
+    uint64_t pdpt_entry = pdpt[pdpt_index];
+
+    if (!(pdpt_entry & PAGE_PRESENT) ||
+        (pdpt_entry & PAGE_HUGE)) {
+        return false;
+    }
+
+    volatile uint64_t *pd = physical_to_virtual(
+        pdpt_entry & PAGE_ADDRESS_MASK,
+        hhdm_offset
+    );
+
+    uint64_t pd_entry = pd[pd_index];
+
+    if (!(pd_entry & PAGE_PRESENT) ||
+        (pd_entry & PAGE_HUGE)) {
+        return false;
+    }
+
+    volatile uint64_t *pt = physical_to_virtual(
+        pd_entry & PAGE_ADDRESS_MASK,
+        hhdm_offset
+    );
+
+    uint64_t pt_entry = pt[pt_index];
+
+    if (!(pt_entry & PAGE_PRESENT)) {
+        return false;
+    }
+
+    *physical_address = pt_entry & PAGE_ADDRESS_MASK;
+
+    // Remove the mapping, but do not free the mapped physical frame.
+    pt[pt_index] = 0;
+
+    __asm__ volatile (
+        "invlpg (%0)"
+        :
+        : "r"(virtual_address)
+        : "memory"
+    );
+
+    // Reclaim the PT only if it is now empty.
+    uint64_t pt_frame = pd_entry & PAGE_ADDRESS_MASK;
+
+    if (page_table_is_empty(pt)) {
+        rollback_table(
+            pd,
+            pd_index,
+            pt_frame,
+            hhdm_offset
+        );
+
+        // Reclaim the PD only if it is now empty.
+        uint64_t pd_frame = pdpt_entry & PAGE_ADDRESS_MASK;
+
+        if (page_table_is_empty(pd)) {
+            rollback_table(
+                pdpt,
+                pdpt_index,
+                pd_frame,
+                hhdm_offset
+            );
+
+            // Reclaim the PDPT only if it is now empty.
+            uint64_t pdpt_frame = pml4_entry & PAGE_ADDRESS_MASK;
+
+            if (page_table_is_empty(pdpt)) {
+                rollback_table(
+                    pml4,
+                    pml4_index,
+                    pdpt_frame,
+                    hhdm_offset
+                );
+            }
+        }
+    }
+
+    return true;
+}
