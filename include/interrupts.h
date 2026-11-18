@@ -13,6 +13,13 @@ void idt_init(void);
 void double_fault_test(void);
 void exception_handler(struct interrupt_frame_t *frame);
 
+/* Controlled page fault testing */
+void page_fault_arm(uint32_t address, uint32_t recovery_eip);
+void page_fault_disarm(void);
+uint32_t page_fault_was_caught(void);
+uint32_t page_fault_get_last_error(void);
+
+
 void pic_init(void);
 void pit_init(uint32_t frequency);
 void irq_handler(uint32_t vector);

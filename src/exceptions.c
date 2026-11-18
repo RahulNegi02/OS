@@ -29,6 +29,39 @@ static void print_hex(int row, int col, uint32_t value)
     }
 }
 
+
+/* Controlled page fault recovery state */
+
+static volatile uint32_t expected_fault_address = 0;
+static volatile uint32_t page_fault_recovery_eip = 0;
+static volatile uint32_t expected_fault_active = 0;
+static volatile uint32_t page_fault_caught = 0;
+static volatile uint32_t last_page_fault_error = 0;
+
+void page_fault_arm(uint32_t address, uint32_t recovery_eip)
+{
+    page_fault_caught = 0;
+    last_page_fault_error = 0;
+    expected_fault_address = address;
+    page_fault_recovery_eip = recovery_eip;
+    expected_fault_active = 1;
+}
+
+void page_fault_disarm(void)
+{
+    expected_fault_active = 0;
+}
+
+uint32_t page_fault_was_caught(void)
+{
+    return page_fault_caught;
+}
+
+uint32_t page_fault_get_last_error(void)
+{
+    return last_page_fault_error;
+}
+
 static const char *get_exception_name(uint32_t number)
 {
     switch (number) {
@@ -83,6 +116,21 @@ void exception_handler(struct interrupt_frame_t *frame)
         uint32_t cr2;
 
         __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+
+        /* CONTROLLED PAGE FAULT RECOVERY */
+
+        if (expected_fault_active &&
+            cr2 == expected_fault_address) {
+
+            expected_fault_active = 0;
+            page_fault_caught = 1;
+            last_page_fault_error = frame->err_code;
+
+            frame->eip = page_fault_recovery_eip;
+
+            return;
+        }
+
 
         print_text(7, 0, "PAGE FAULT DIAGNOSTICS");
 

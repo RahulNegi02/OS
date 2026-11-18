@@ -17,7 +17,18 @@ global _start
 extern kernel_main
 
 _start:
+    cli
+
+    ; Save GRUB Multiboot information.
+    ; EAX = Multiboot magic
+    ; EBX = Multiboot information address
+
     mov esp, stack_top
+
+    ; Pass arguments using cdecl.
+    push ebx
+    push eax
+
     call kernel_main
 
 .hang:
