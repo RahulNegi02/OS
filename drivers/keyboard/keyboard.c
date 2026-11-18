@@ -1,0 +1,70 @@
+#include "../../include/keyboard.h"
+
+static inline unsigned char inb(unsigned short port)
+{
+    unsigned char result;
+
+    __asm__ volatile (
+        "inb %1, %0"
+        : "=a"(result)
+        : "Nd"(port)
+    );
+
+    return result;
+}
+
+void keyboard_init(void)
+{
+    /* Basic keyboard initialization placeholder. */
+}
+
+char keyboard_read_char(void)
+{
+    unsigned char status;
+    unsigned char scancode;
+
+    while (1)
+    {
+        status = inb(0x64);
+
+        if (status & 1)
+        {
+            scancode = inb(0x60);
+
+            /* Ignore key-release events for now. */
+            if (scancode & 0x80)
+                continue;
+
+            /* Basic US keyboard mapping: A-Z and digits. */
+            if (scancode >= 0x02 && scancode <= 0x0B)
+            {
+                static const char digits[] = "1234567890";
+                return digits[scancode - 0x02];
+            }
+
+            if (scancode >= 0x10 && scancode <= 0x19)
+            {
+                static const char row1[] = "qwertyuiop";
+                return row1[scancode - 0x10];
+            }
+
+            if (scancode >= 0x1E && scancode <= 0x26)
+            {
+                static const char row2[] = "asdfghjkl";
+                return row2[scancode - 0x1E];
+            }
+
+            if (scancode >= 0x2C && scancode <= 0x32)
+            {
+                static const char row3[] = "zxcvbnm";
+                return row3[scancode - 0x2C];
+            }
+
+            if (scancode == 0x39)
+                return ' ';
+
+            if (scancode == 0x1C)
+                return '\n';
+        }
+    }
+}
