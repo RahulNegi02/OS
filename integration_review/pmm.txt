@@ -1,0 +1,221 @@
+
+#ifndef PMM_H
+#define PMM_H
+
+#include <stdint.h>
+#include <stdbool.h>
+
+#define PMM_PAGE_SIZE 4096ULL
+
+// Initialize the physical memory manager using Limine.
+bool pmm_init(void);
+
+// Allocate one 4 KiB physical frame.
+// Returns its physical address, or 0 on failure.
+uint64_t pmm_alloc_frame(void);
+
+// Release a frame previously allocated by the PMM.
+bool pmm_free_frame(uint64_t physical_address);
+
+// Return the number of free frames.
+uint64_t pmm_get_free_frames(void);
+
+void pmm_test_fail_allocation_after(uint64_t successful_allocations);
+#endif
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <limine.h>
+#include "pmm.h"
+
+#define PMM_MAX_MEMORY (4ULL * 1024 * 1024 * 1024)
+#define PMM_MAX_FRAMES (PMM_MAX_MEMORY / PMM_PAGE_SIZE)
+#define PMM_BITMAP_BYTES (PMM_MAX_FRAMES / 8)
+
+static uint8_t usable_bitmap[PMM_BITMAP_BYTES];
+static uint8_t allocated_bitmap[PMM_BITMAP_BYTES];
+static uint64_t free_frames;
+static bool initialized;
+
+// Test hook: fail an allocation after N successful allocations.
+static bool test_failure_enabled = false;
+static uint64_t test_allocations_before_failure = 0;
+
+void pmm_test_fail_allocation_after(uint64_t successful_allocations)
+{
+    test_allocations_before_failure = successful_allocations;
+    test_failure_enabled = true;
+}
+
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_memmap_request memmap_request = {
+    .id = LIMINE_MEMMAP_REQUEST_ID,
+    .revision = 0
+};
+
+static bool bit_get(const uint8_t *map, uint64_t frame)
+{
+    return (map[frame / 8] & (1U << (frame % 8))) != 0;
+}
+
+static void bit_set(uint8_t *map, uint64_t frame)
+{
+    map[frame / 8] |= (uint8_t)(1U << (frame % 8));
+}
+
+static void bit_clear(uint8_t *map, uint64_t frame)
+{
+    map[frame / 8] &= (uint8_t)~(1U << (frame % 8));
+}
+
+bool pmm_init(void)
+{
+    if (initialized) {
+        return true;
+    }
+
+    free_frames = 0;
+
+    // Initially, every frame is unavailable.
+    for (uint64_t i = 0; i < PMM_BITMAP_BYTES; i++) {
+        usable_bitmap[i] = 0;
+        allocated_bitmap[i] = 0;
+    }
+
+    struct limine_memmap_response *response =
+        memmap_request.response;
+
+    if (response == NULL || response->entries == NULL) {
+        return false;
+    }
+
+    for (uint64_t i = 0; i < response->entry_count; i++) {
+        struct limine_memmap_entry *entry =
+            response->entries[i];
+
+        if (entry == NULL ||
+            entry->type != LIMINE_MEMMAP_USABLE ||
+            entry->length == 0) {
+            continue;
+        }
+
+        // Reject address-range overflow.
+        if (entry->base > UINT64_MAX - entry->length) {
+            continue;
+        }
+
+        uint64_t start = entry->base;
+        uint64_t end = entry->base + entry->length;
+
+        // Ignore memory above our initial 4 GiB limit.
+        if (start >= PMM_MAX_MEMORY) {
+            continue;
+        }
+
+        if (end > PMM_MAX_MEMORY) {
+            end = PMM_MAX_MEMORY;
+        }
+
+        // Only complete, aligned frames are eligible.
+        uint64_t first_frame = start / PMM_PAGE_SIZE;
+
+        if (start % PMM_PAGE_SIZE != 0) {
+            first_frame++;
+        }
+
+        uint64_t last_frame = end / PMM_PAGE_SIZE;
+
+        // Physical address zero is reserved as the failure sentinel.
+        if (first_frame == 0) {
+            first_frame = 1;
+        }
+
+        if (first_frame > PMM_MAX_FRAMES) {
+            continue;
+        }
+
+        if (last_frame > PMM_MAX_FRAMES) {
+            last_frame = PMM_MAX_FRAMES;
+        }
+
+        for (uint64_t frame = first_frame;
+             frame < last_frame;
+             frame++) {
+
+            if (!bit_get(usable_bitmap, frame)) {
+                bit_set(usable_bitmap, frame);
+                free_frames++;
+            }
+        }
+    }
+
+    initialized = true;
+    return true;
+}
+
+uint64_t pmm_alloc_frame(void)
+{
+    if (!initialized) {
+        return 0;
+    }
+
+    // Test hook: fail once after the requested number of
+    // successful allocation attempts.
+    if (test_failure_enabled) {
+        if (test_allocations_before_failure == 0) {
+            test_failure_enabled = false;
+            return 0;
+        }
+
+        test_allocations_before_failure--;
+    }
+
+    if (free_frames == 0) {
+        return 0;
+    }
+
+    for (uint64_t frame = 1;
+         frame < PMM_MAX_FRAMES;
+         frame++) {
+
+        if (bit_get(usable_bitmap, frame) &&
+            !bit_get(allocated_bitmap, frame)) {
+
+            bit_set(allocated_bitmap, frame);
+            free_frames--;
+
+            return frame * PMM_PAGE_SIZE;
+        }
+    }
+
+    return 0;
+}
+
+bool pmm_free_frame(uint64_t physical_address)
+{
+    if (!initialized ||
+        physical_address == 0 ||
+        physical_address % PMM_PAGE_SIZE != 0 ||
+        physical_address >= PMM_MAX_MEMORY) {
+        return false;
+    }
+
+    uint64_t frame = physical_address / PMM_PAGE_SIZE;
+
+    // Never free a frame outside usable RAM or free it twice.
+    if (!bit_get(usable_bitmap, frame) ||
+        !bit_get(allocated_bitmap, frame)) {
+        return false;
+    }
+
+    bit_clear(allocated_bitmap, frame);
+    free_frames++;
+
+    return true;
+}
+
+uint64_t pmm_get_free_frames(void)
+{
+    return initialized ? free_frames : 0;
+}

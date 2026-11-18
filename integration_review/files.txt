@@ -1,0 +1,15 @@
+drivers/keyboard/keyboard.c
+kernel/kernel.c
+kernel/src/fault_tests.S
+kernel/src/heap.c
+kernel/src/heap.h
+kernel/src/idt.c
+kernel/src/idt.h
+kernel/src/isr.S
+kernel/src/main.c
+kernel/src/pmm.c
+kernel/src/pmm.h
+kernel/src/serial.c
+kernel/src/serial.h
+kernel/src/vmm.c
+kernel/src/vmm.h

@@ -15,56 +15,42 @@ static inline unsigned char inb(unsigned short port)
 
 void keyboard_init(void)
 {
-    /* Basic keyboard initialization placeholder. */
 }
 
-char keyboard_read_char(void)
+int keyboard_try_read_char(char *out)
 {
-    unsigned char status;
-    unsigned char scancode;
+    if (!(inb(0x64) & 1))
+        return 0;
 
-    while (1)
-    {
-        status = inb(0x64);
+    unsigned char sc = inb(0x60);
 
-        if (status & 1)
-        {
-            scancode = inb(0x60);
+    if (sc & 0x80)
+        return 0;
 
-            /* Ignore key-release events for now. */
-            if (scancode & 0x80)
-                continue;
-
-            /* Basic US keyboard mapping: A-Z and digits. */
-            if (scancode >= 0x02 && scancode <= 0x0B)
-            {
-                static const char digits[] = "1234567890";
-                return digits[scancode - 0x02];
-            }
-
-            if (scancode >= 0x10 && scancode <= 0x19)
-            {
-                static const char row1[] = "qwertyuiop";
-                return row1[scancode - 0x10];
-            }
-
-            if (scancode >= 0x1E && scancode <= 0x26)
-            {
-                static const char row2[] = "asdfghjkl";
-                return row2[scancode - 0x1E];
-            }
-
-            if (scancode >= 0x2C && scancode <= 0x32)
-            {
-                static const char row3[] = "zxcvbnm";
-                return row3[scancode - 0x2C];
-            }
-
-            if (scancode == 0x39)
-                return ' ';
-
-            if (scancode == 0x1C)
-                return '\n';
-        }
+    if (sc >= 0x02 && sc <= 0x0B) {
+        static const char keys[] = "1234567890";
+        *out = keys[sc - 0x02];
     }
+    else if (sc >= 0x10 && sc <= 0x19) {
+        static const char keys[] = "qwertyuiop";
+        *out = keys[sc - 0x10];
+    }
+    else if (sc >= 0x1E && sc <= 0x26) {
+        static const char keys[] = "asdfghjkl";
+        *out = keys[sc - 0x1E];
+    }
+    else if (sc >= 0x2C && sc <= 0x32) {
+        static const char keys[] = "zxcvbnm";
+        *out = keys[sc - 0x2C];
+    }
+    else if (sc == 0x39)
+        *out = ' ';
+    else if (sc == 0x1C)
+        *out = '\n';
+    else if (sc == 0x0E)
+        *out = '\b';
+    else
+        return 0;
+
+    return 1;
 }

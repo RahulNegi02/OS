@@ -1,0 +1,1150 @@
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <limine.h>
+#include "pmm.h"
+
+#define PMM_MAX_MEMORY (4ULL * 1024 * 1024 * 1024)
+#define PMM_MAX_FRAMES (PMM_MAX_MEMORY / PMM_PAGE_SIZE)
+#define PMM_BITMAP_BYTES (PMM_MAX_FRAMES / 8)
+
+static uint8_t usable_bitmap[PMM_BITMAP_BYTES];
+static uint8_t allocated_bitmap[PMM_BITMAP_BYTES];
+static uint64_t free_frames;
+static bool initialized;
+
+// Test hook: fail an allocation after N successful allocations.
+static bool test_failure_enabled = false;
+static uint64_t test_allocations_before_failure = 0;
+
+void pmm_test_fail_allocation_after(uint64_t successful_allocations)
+{
+    test_allocations_before_failure = successful_allocations;
+    test_failure_enabled = true;
+}
+
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_memmap_request memmap_request = {
+    .id = LIMINE_MEMMAP_REQUEST_ID,
+    .revision = 0
+};
+
+static bool bit_get(const uint8_t *map, uint64_t frame)
+{
+    return (map[frame / 8] & (1U << (frame % 8))) != 0;
+}
+
+static void bit_set(uint8_t *map, uint64_t frame)
+{
+    map[frame / 8] |= (uint8_t)(1U << (frame % 8));
+}
+
+static void bit_clear(uint8_t *map, uint64_t frame)
+{
+    map[frame / 8] &= (uint8_t)~(1U << (frame % 8));
+}
+
+bool pmm_init(void)
+{
+    if (initialized) {
+        return true;
+    }
+
+    free_frames = 0;
+
+    // Initially, every frame is unavailable.
+    for (uint64_t i = 0; i < PMM_BITMAP_BYTES; i++) {
+        usable_bitmap[i] = 0;
+        allocated_bitmap[i] = 0;
+    }
+
+    struct limine_memmap_response *response =
+        memmap_request.response;
+
+    if (response == NULL || response->entries == NULL) {
+        return false;
+    }
+
+    for (uint64_t i = 0; i < response->entry_count; i++) {
+        struct limine_memmap_entry *entry =
+            response->entries[i];
+
+        if (entry == NULL ||
+            entry->type != LIMINE_MEMMAP_USABLE ||
+            entry->length == 0) {
+            continue;
+        }
+
+        // Reject address-range overflow.
+        if (entry->base > UINT64_MAX - entry->length) {
+            continue;
+        }
+
+        uint64_t start = entry->base;
+        uint64_t end = entry->base + entry->length;
+
+        // Ignore memory above our initial 4 GiB limit.
+        if (start >= PMM_MAX_MEMORY) {
+            continue;
+        }
+
+        if (end > PMM_MAX_MEMORY) {
+            end = PMM_MAX_MEMORY;
+        }
+
+        // Only complete, aligned frames are eligible.
+        uint64_t first_frame = start / PMM_PAGE_SIZE;
+
+        if (start % PMM_PAGE_SIZE != 0) {
+            first_frame++;
+        }
+
+        uint64_t last_frame = end / PMM_PAGE_SIZE;
+
+        // Physical address zero is reserved as the failure sentinel.
+        if (first_frame == 0) {
+            first_frame = 1;
+        }
+
+        if (first_frame > PMM_MAX_FRAMES) {
+            continue;
+        }
+
+        if (last_frame > PMM_MAX_FRAMES) {
+            last_frame = PMM_MAX_FRAMES;
+        }
+
+        for (uint64_t frame = first_frame;
+             frame < last_frame;
+             frame++) {
+
+            if (!bit_get(usable_bitmap, frame)) {
+                bit_set(usable_bitmap, frame);
+                free_frames++;
+            }
+        }
+    }
+
+    initialized = true;
+    return true;
+}
+
+uint64_t pmm_alloc_frame(void)
+{
+    if (!initialized) {
+        return 0;
+    }
+
+    // Test hook: fail once after the requested number of
+    // successful allocation attempts.
+    if (test_failure_enabled) {
+        if (test_allocations_before_failure == 0) {
+            test_failure_enabled = false;
+            return 0;
+        }
+
+        test_allocations_before_failure--;
+    }
+
+    if (free_frames == 0) {
+        return 0;
+    }
+
+    for (uint64_t frame = 1;
+         frame < PMM_MAX_FRAMES;
+         frame++) {
+
+        if (bit_get(usable_bitmap, frame) &&
+            !bit_get(allocated_bitmap, frame)) {
+
+            bit_set(allocated_bitmap, frame);
+            free_frames--;
+
+            return frame * PMM_PAGE_SIZE;
+        }
+    }
+
+    return 0;
+}
+
+bool pmm_free_frame(uint64_t physical_address)
+{
+    if (!initialized ||
+        physical_address == 0 ||
+        physical_address % PMM_PAGE_SIZE != 0 ||
+        physical_address >= PMM_MAX_MEMORY) {
+        return false;
+    }
+
+    uint64_t frame = physical_address / PMM_PAGE_SIZE;
+
+    // Never free a frame outside usable RAM or free it twice.
+    if (!bit_get(usable_bitmap, frame) ||
+        !bit_get(allocated_bitmap, frame)) {
+        return false;
+    }
+
+    bit_clear(allocated_bitmap, frame);
+    free_frames++;
+
+    return true;
+}
+
+uint64_t pmm_get_free_frames(void)
+{
+    return initialized ? free_frames : 0;
+}
+#include <stdint.h>
+#include <stdbool.h>
+
+#include "vmm.h"
+#include "pmm.h"
+
+// Hardware page-table entry flags.
+#define PAGE_PRESENT       (1ULL << 0)
+#define PAGE_WRITABLE      (1ULL << 1)
+#define PAGE_USER          (1ULL << 2)
+#define PAGE_HUGE          (1ULL << 7)
+
+#define PAGE_ADDRESS_MASK  0x000FFFFFFFFFF000ULL
+#define PAGE_2MB_MASK      0x000FFFFFFFE00000ULL
+#define PAGE_1GB_MASK      0x000FFFFFC0000000ULL
+#define PAGE_NO_EXECUTE    (1ULL << 63)
+
+#define CPUID_EXT_MAX      0x80000000U
+#define CPUID_EXT_FEATURES 0x80000001U
+#define CPUID_NX_BIT       (1U << 20)
+
+#define MSR_EFER           0xC0000080U
+#define EFER_NXE           (1ULL << 11)
+
+#define OFFSET_4KB         0xFFFULL
+#define OFFSET_2MB         0x1FFFFFULL
+#define OFFSET_1GB         0x3FFFFFFFULL
+
+static bool nx_enabled = false;
+
+
+// Read the current page-table root address from CR3.
+static uint64_t read_cr3(void)
+{
+    uint64_t value;
+
+    __asm__ volatile (
+        "mov %%cr3, %0"
+        : "=r"(value)
+    );
+
+    return value;
+}
+
+
+// Enable the CPU's No-Execute (NX) page protection feature.
+bool vmm_enable_nx(void)
+{
+    uint32_t eax, ebx, ecx, edx;
+
+    __asm__ volatile (
+        "cpuid"
+        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+        : "a"(CPUID_EXT_MAX), "c"(0)
+    );
+
+    if (eax < CPUID_EXT_FEATURES) {
+        return false;
+    }
+
+    __asm__ volatile (
+        "cpuid"
+        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+        : "a"(CPUID_EXT_FEATURES), "c"(0)
+    );
+
+    if ((edx & CPUID_NX_BIT) == 0) {
+        return false;
+    }
+
+    uint32_t efer_low, efer_high;
+
+    __asm__ volatile (
+        "rdmsr"
+        : "=a"(efer_low), "=d"(efer_high)
+        : "c"(MSR_EFER)
+    );
+
+    uint64_t efer =
+        ((uint64_t)efer_high << 32) | efer_low;
+
+    efer |= EFER_NXE;
+
+    __asm__ volatile (
+        "wrmsr"
+        :
+        : "c"(MSR_EFER),
+          "a"((uint32_t)efer),
+          "d"((uint32_t)(efer >> 32))
+        : "memory"
+    );
+
+    nx_enabled = true;
+
+    return true;
+}
+
+
+// Check whether an address is canonical for four-level paging.
+static bool is_canonical(uint64_t address)
+{
+    uint64_t upper = address >> 48;
+    bool sign_bit = ((address >> 47) & 1) != 0;
+
+    if (sign_bit) {
+        return upper == 0xFFFF;
+    }
+
+    return upper == 0;
+}
+
+
+// Convert a physical address to its HHDM virtual address.
+static volatile uint64_t *physical_to_virtual(
+    uint64_t physical_address,
+    uint64_t hhdm_offset
+)
+{
+    return (volatile uint64_t *)(uintptr_t)(
+        hhdm_offset + physical_address
+    );
+}
+
+
+// Clear a newly allocated page-table frame.
+static void zero_page(
+    uint64_t physical_address,
+    uint64_t hhdm_offset
+)
+{
+    volatile uint64_t *page =
+        physical_to_virtual(physical_address, hhdm_offset);
+
+    for (uint64_t i = 0;
+         i < PMM_PAGE_SIZE / sizeof(uint64_t);
+         i++) {
+        page[i] = 0;
+    }
+}
+
+
+// Get an existing child table or allocate a new one.
+static bool get_or_create_table(
+    volatile uint64_t *parent,
+    uint64_t index,
+    uint64_t hhdm_offset,
+    bool user,
+    volatile uint64_t **result,
+    bool *created,
+    uint64_t *created_frame
+)
+{
+    *created = false;
+    *created_frame = 0;
+
+    uint64_t entry = parent[index];
+
+    if (entry & PAGE_PRESENT) {
+        if (entry & PAGE_HUGE) {
+            return false;
+        }
+
+        if (user && !(entry & PAGE_USER)) {
+            parent[index] = entry | PAGE_USER;
+        }
+
+        *result = physical_to_virtual(
+            entry & PAGE_ADDRESS_MASK,
+            hhdm_offset
+        );
+
+        return true;
+    }
+
+    uint64_t new_frame = pmm_alloc_frame();
+
+    if (new_frame == 0) {
+        return false;
+    }
+
+    zero_page(new_frame, hhdm_offset);
+
+    uint64_t new_entry =
+        new_frame | PAGE_PRESENT | PAGE_WRITABLE;
+
+    if (user) {
+        new_entry |= PAGE_USER;
+    }
+
+    parent[index] = new_entry;
+
+    *result = physical_to_virtual(new_frame, hhdm_offset);
+    *created = true;
+    *created_frame = new_frame;
+
+    return true;
+}
+
+
+// Return true only when a page table contains no present entries.
+static bool page_table_is_empty(volatile uint64_t *table)
+{
+    for (uint64_t i = 0; i < 512; i++) {
+        if (table[i] & PAGE_PRESENT) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+
+// Remove and free a table only if it is empty and its parent
+// entry still points to the expected physical frame.
+static void rollback_table(
+    volatile uint64_t *parent,
+    uint64_t index,
+    uint64_t frame,
+    uint64_t hhdm_offset
+)
+{
+    if (frame == 0) {
+        return;
+    }
+
+    uint64_t entry = parent[index];
+
+    if (!(entry & PAGE_PRESENT) ||
+        (entry & PAGE_ADDRESS_MASK) != frame) {
+        return;
+    }
+
+    volatile uint64_t *table =
+        physical_to_virtual(frame, hhdm_offset);
+
+    if (!page_table_is_empty(table)) {
+        return;
+    }
+
+    // Disconnect the table before returning its frame to the PMM.
+    parent[index] = 0;
+
+    pmm_free_frame(frame);
+}
+
+
+// Translate a virtual address to a physical address.
+// Supports 4 KiB, 2 MiB, and 1 GiB pages.
+bool vmm_translate(
+    uint64_t virtual_address,
+    uint64_t hhdm_offset,
+    uint64_t *physical_address
+)
+{
+    if (physical_address == 0 ||
+        !is_canonical(virtual_address)) {
+        return false;
+    }
+
+    uint64_t pml4_index = (virtual_address >> 39) & 0x1FF;
+    uint64_t pdpt_index = (virtual_address >> 30) & 0x1FF;
+    uint64_t pd_index   = (virtual_address >> 21) & 0x1FF;
+    uint64_t pt_index   = (virtual_address >> 12) & 0x1FF;
+
+    uint64_t pml4_physical =
+        read_cr3() & PAGE_ADDRESS_MASK;
+
+    volatile uint64_t *pml4 =
+        physical_to_virtual(pml4_physical, hhdm_offset);
+
+    uint64_t pml4_entry = pml4[pml4_index];
+
+    if (!(pml4_entry & PAGE_PRESENT)) {
+        return false;
+    }
+
+    volatile uint64_t *pdpt = physical_to_virtual(
+        pml4_entry & PAGE_ADDRESS_MASK,
+        hhdm_offset
+    );
+
+    uint64_t pdpt_entry = pdpt[pdpt_index];
+
+    if (!(pdpt_entry & PAGE_PRESENT)) {
+        return false;
+    }
+
+    // A huge page at this level maps 1 GiB.
+    if (pdpt_entry & PAGE_HUGE) {
+        *physical_address =
+            (pdpt_entry & PAGE_1GB_MASK)
+            | (virtual_address & OFFSET_1GB);
+
+        return true;
+    }
+
+    volatile uint64_t *pd = physical_to_virtual(
+        pdpt_entry & PAGE_ADDRESS_MASK,
+        hhdm_offset
+    );
+
+    uint64_t pd_entry = pd[pd_index];
+
+    if (!(pd_entry & PAGE_PRESENT)) {
+        return false;
+    }
+
+    // A huge page at this level maps 2 MiB.
+    if (pd_entry & PAGE_HUGE) {
+        *physical_address =
+            (pd_entry & PAGE_2MB_MASK)
+            | (virtual_address & OFFSET_2MB);
+
+        return true;
+    }
+
+    volatile uint64_t *pt = physical_to_virtual(
+        pd_entry & PAGE_ADDRESS_MASK,
+        hhdm_offset
+    );
+
+    uint64_t pt_entry = pt[pt_index];
+
+    if (!(pt_entry & PAGE_PRESENT)) {
+        return false;
+    }
+
+    *physical_address =
+        (pt_entry & PAGE_ADDRESS_MASK)
+        | (virtual_address & OFFSET_4KB);
+
+    return true;
+}
+
+
+// Map a 4 KiB page with specified permissions.
+bool vmm_map_page_flags(
+    uint64_t virtual_address,
+    uint64_t physical_address,
+    uint64_t hhdm_offset,
+    uint64_t flags
+)
+{
+    const uint64_t allowed_flags =
+        VMM_READ | VMM_WRITE | VMM_USER | VMM_NO_EXEC;
+
+    if ((flags & ~allowed_flags) != 0 ||
+        !(flags & VMM_READ) ||
+        !is_canonical(virtual_address) ||
+        (virtual_address & OFFSET_4KB) != 0 ||
+        (physical_address & OFFSET_4KB) != 0 ||
+        (physical_address & ~PAGE_ADDRESS_MASK) != 0) {
+        return false;
+    }
+
+    if ((flags & VMM_NO_EXEC) && !nx_enabled) {
+        return false;
+    }
+
+    uint64_t pml4_index = (virtual_address >> 39) & 0x1FF;
+    uint64_t pdpt_index = (virtual_address >> 30) & 0x1FF;
+    uint64_t pd_index   = (virtual_address >> 21) & 0x1FF;
+    uint64_t pt_index   = (virtual_address >> 12) & 0x1FF;
+
+    bool user = (flags & VMM_USER) != 0;
+
+    volatile uint64_t *pml4 = physical_to_virtual(
+        read_cr3() & PAGE_ADDRESS_MASK,
+        hhdm_offset
+    );
+
+    volatile uint64_t *pdpt;
+    volatile uint64_t *pd;
+    volatile uint64_t *pt;
+
+    bool pdpt_created;
+    uint64_t pdpt_frame;
+
+    if (!get_or_create_table(
+            pml4,
+            pml4_index,
+            hhdm_offset,
+            user,
+            &pdpt,
+            &pdpt_created,
+            &pdpt_frame)) {
+        return false;
+    }
+
+    bool pd_created;
+    uint64_t pd_frame;
+
+    if (!get_or_create_table(
+            pdpt,
+            pdpt_index,
+            hhdm_offset,
+            user,
+            &pd,
+            &pd_created,
+            &pd_frame)) {
+
+        if (pdpt_created) {
+            rollback_table(
+                pml4,
+                pml4_index,
+                pdpt_frame,
+                hhdm_offset
+            );
+        }
+
+        return false;
+    }
+
+    bool pt_created;
+    uint64_t pt_frame;
+
+    if (!get_or_create_table(
+            pd,
+            pd_index,
+            hhdm_offset,
+            user,
+            &pt,
+            &pt_created,
+            &pt_frame)) {
+
+        if (pd_created) {
+            rollback_table(
+                pdpt,
+                pdpt_index,
+                pd_frame,
+                hhdm_offset
+            );
+        }
+
+        if (pdpt_created) {
+            rollback_table(
+                pml4,
+                pml4_index,
+                pdpt_frame,
+                hhdm_offset
+            );
+        }
+
+        return false;
+    }
+
+    // Never overwrite an existing mapping.
+    if (pt[pt_index] & PAGE_PRESENT) {
+        if (pt_created) {
+            rollback_table(
+                pd,
+                pd_index,
+                pt_frame,
+                hhdm_offset
+            );
+        }
+
+        if (pd_created) {
+            rollback_table(
+                pdpt,
+                pdpt_index,
+                pd_frame,
+                hhdm_offset
+            );
+        }
+
+        if (pdpt_created) {
+            rollback_table(
+                pml4,
+                pml4_index,
+                pdpt_frame,
+                hhdm_offset
+            );
+        }
+
+        return false;
+    }
+
+    uint64_t entry = physical_address | PAGE_PRESENT;
+
+    if (flags & VMM_WRITE) {
+        entry |= PAGE_WRITABLE;
+    }
+
+    if (user) {
+        entry |= PAGE_USER;
+    }
+
+    if (flags & VMM_NO_EXEC) {
+        entry |= PAGE_NO_EXECUTE;
+    }
+
+    pt[pt_index] = entry;
+
+    __asm__ volatile (
+        "invlpg (%0)"
+        :
+        : "r"(virtual_address)
+        : "memory"
+    );
+
+    return true;
+}
+
+
+// Map a 4 KiB page with default read/write permissions.
+bool vmm_map_page(
+    uint64_t virtual_address,
+    uint64_t physical_address,
+    uint64_t hhdm_offset
+)
+{
+    return vmm_map_page_flags(
+        virtual_address,
+        physical_address,
+        hhdm_offset,
+        VMM_READ | VMM_WRITE
+    );
+}
+
+
+// Remove a 4 KiB mapping and return its physical frame.
+// The physical frame is NOT freed by this function.
+bool vmm_unmap_page(
+    uint64_t virtual_address,
+    uint64_t hhdm_offset,
+    uint64_t *physical_address
+)
+{
+    if (physical_address == 0 ||
+        !is_canonical(virtual_address) ||
+        (virtual_address & OFFSET_4KB) != 0) {
+        return false;
+    }
+
+    uint64_t pml4_index = (virtual_address >> 39) & 0x1FF;
+    uint64_t pdpt_index = (virtual_address >> 30) & 0x1FF;
+    uint64_t pd_index   = (virtual_address >> 21) & 0x1FF;
+    uint64_t pt_index   = (virtual_address >> 12) & 0x1FF;
+
+    volatile uint64_t *pml4 = physical_to_virtual(
+        read_cr3() & PAGE_ADDRESS_MASK,
+        hhdm_offset
+    );
+
+    uint64_t pml4_entry = pml4[pml4_index];
+
+    if (!(pml4_entry & PAGE_PRESENT)) {
+        return false;
+    }
+
+    volatile uint64_t *pdpt = physical_to_virtual(
+        pml4_entry & PAGE_ADDRESS_MASK,
+        hhdm_offset
+    );
+
+    uint64_t pdpt_entry = pdpt[pdpt_index];
+
+    if (!(pdpt_entry & PAGE_PRESENT) ||
+        (pdpt_entry & PAGE_HUGE)) {
+        return false;
+    }
+
+    volatile uint64_t *pd = physical_to_virtual(
+        pdpt_entry & PAGE_ADDRESS_MASK,
+        hhdm_offset
+    );
+
+    uint64_t pd_entry = pd[pd_index];
+
+    if (!(pd_entry & PAGE_PRESENT) ||
+        (pd_entry & PAGE_HUGE)) {
+        return false;
+    }
+
+    volatile uint64_t *pt = physical_to_virtual(
+        pd_entry & PAGE_ADDRESS_MASK,
+        hhdm_offset
+    );
+
+    uint64_t pt_entry = pt[pt_index];
+
+    if (!(pt_entry & PAGE_PRESENT)) {
+        return false;
+    }
+
+    *physical_address = pt_entry & PAGE_ADDRESS_MASK;
+
+    // Remove the mapping, but do not free the mapped physical frame.
+    pt[pt_index] = 0;
+
+    __asm__ volatile (
+        "invlpg (%0)"
+        :
+        : "r"(virtual_address)
+        : "memory"
+    );
+
+    // Reclaim the PT only if it is now empty.
+    uint64_t pt_frame = pd_entry & PAGE_ADDRESS_MASK;
+
+    if (page_table_is_empty(pt)) {
+        rollback_table(
+            pd,
+            pd_index,
+            pt_frame,
+            hhdm_offset
+        );
+
+        // Reclaim the PD only if it is now empty.
+        uint64_t pd_frame = pdpt_entry & PAGE_ADDRESS_MASK;
+
+        if (page_table_is_empty(pd)) {
+            rollback_table(
+                pdpt,
+                pdpt_index,
+                pd_frame,
+                hhdm_offset
+            );
+
+            // Reclaim the PDPT only if it is now empty.
+            uint64_t pdpt_frame = pml4_entry & PAGE_ADDRESS_MASK;
+
+            if (page_table_is_empty(pdpt)) {
+                rollback_table(
+                    pml4,
+                    pml4_index,
+                    pdpt_frame,
+                    hhdm_offset
+                );
+            }
+        }
+    }
+
+    return true;
+}
+#include "heap.h"
+#include "pmm.h"
+#include "vmm.h"
+
+#define HEAP_START       0xFFFF900000000000ULL
+#define HEAP_PAGE_SIZE   4096ULL
+#define HEAP_MAX_PAGES   256ULL
+#define HEAP_SIZE        (HEAP_MAX_PAGES * HEAP_PAGE_SIZE)
+#define HEAP_MAX_ALLOCS  128ULL
+
+#define HEAP_FLAGS (VMM_READ | VMM_WRITE | VMM_NO_EXEC)
+
+typedef struct {
+    void *address;
+    uint64_t first_page;
+    uint64_t page_count;
+    bool used;
+} heap_allocation_t;
+
+static uint64_t heap_hhdm_offset;
+static bool heap_initialized;
+
+static bool page_used[HEAP_MAX_PAGES];
+static heap_allocation_t allocations[HEAP_MAX_ALLOCS];
+
+bool heap_init(uint64_t hhdm_offset)
+{
+    if (heap_initialized) {
+        return false;
+    }
+
+    /* Verify that the complete heap range is unmapped. */
+    for (uint64_t i = 0; i < HEAP_MAX_PAGES; i++) {
+        uint64_t physical = 0;
+        uint64_t address =
+            HEAP_START + i * HEAP_PAGE_SIZE;
+
+        if (vmm_translate(address, hhdm_offset, &physical)) {
+            return false;
+        }
+    }
+
+    heap_hhdm_offset = hhdm_offset;
+
+    for (uint64_t i = 0; i < HEAP_MAX_PAGES; i++) {
+        page_used[i] = false;
+    }
+
+    for (uint64_t i = 0; i < HEAP_MAX_ALLOCS; i++) {
+        allocations[i].address = NULL;
+        allocations[i].first_page = 0;
+        allocations[i].page_count = 0;
+        allocations[i].used = false;
+    }
+
+    heap_initialized = true;
+    return true;
+}
+
+void *kmalloc(size_t size)
+{
+    if (!heap_initialized || size == 0 ||
+        (uint64_t)size > HEAP_SIZE) {
+        return NULL;
+    }
+
+    uint64_t pages =
+        ((uint64_t)size + HEAP_PAGE_SIZE - 1) /
+        HEAP_PAGE_SIZE;
+
+    /* Find an available allocation record. */
+    uint64_t slot = HEAP_MAX_ALLOCS;
+
+    for (uint64_t i = 0; i < HEAP_MAX_ALLOCS; i++) {
+        if (!allocations[i].used) {
+            slot = i;
+            break;
+        }
+    }
+
+    if (slot == HEAP_MAX_ALLOCS) {
+        return NULL;
+    }
+
+    /* Find contiguous free virtual pages. */
+    uint64_t first_page = HEAP_MAX_PAGES;
+    uint64_t run = 0;
+
+    for (uint64_t i = 0; i < HEAP_MAX_PAGES; i++) {
+        if (!page_used[i]) {
+            if (run == 0) {
+                first_page = i;
+            }
+
+            run++;
+
+            if (run == pages) {
+                break;
+            }
+        } else {
+            run = 0;
+            first_page = HEAP_MAX_PAGES;
+        }
+    }
+
+    if (run < pages || first_page >= HEAP_MAX_PAGES) {
+        return NULL;
+    }
+
+    /* Allocate physical frames and map them. */
+    uint64_t mapped = 0;
+
+    for (; mapped < pages; mapped++) {
+        uint64_t physical = pmm_alloc_frame();
+
+        if (physical == 0) {
+            break;
+        }
+
+        uint64_t address =
+            HEAP_START +
+            (first_page + mapped) * HEAP_PAGE_SIZE;
+
+        if (!vmm_map_page_flags(
+                address,
+                physical,
+                heap_hhdm_offset,
+                HEAP_FLAGS)) {
+
+            pmm_free_frame(physical);
+            break;
+        }
+
+        /* Initialize the new page to zero. */
+        volatile uint8_t *memory =
+            (volatile uint8_t *)(uintptr_t)address;
+
+        for (uint64_t j = 0; j < HEAP_PAGE_SIZE; j++) {
+            memory[j] = 0;
+        }
+    }
+
+    /* Roll back if the complete allocation failed. */
+    if (mapped != pages) {
+        while (mapped > 0) {
+            mapped--;
+
+            uint64_t address =
+                HEAP_START +
+                (first_page + mapped) * HEAP_PAGE_SIZE;
+
+            uint64_t physical = 0;
+
+            if (vmm_unmap_page(
+                    address,
+                    heap_hhdm_offset,
+                    &physical)) {
+                pmm_free_frame(physical);
+            }
+        }
+
+        return NULL;
+    }
+
+    /* Update metadata only after successful mapping. */
+    for (uint64_t i = 0; i < pages; i++) {
+        page_used[first_page + i] = true;
+    }
+
+    void *result = (void *)(uintptr_t)(
+        HEAP_START + first_page * HEAP_PAGE_SIZE);
+
+    allocations[slot].address = result;
+    allocations[slot].first_page = first_page;
+    allocations[slot].page_count = pages;
+    allocations[slot].used = true;
+
+    return result;
+}
+
+void kfree(void *ptr)
+{
+    if (!heap_initialized || ptr == NULL) {
+        return;
+    }
+
+    /* Find the exact allocation. */
+    uint64_t slot = HEAP_MAX_ALLOCS;
+
+    for (uint64_t i = 0; i < HEAP_MAX_ALLOCS; i++) {
+        if (allocations[i].used &&
+            allocations[i].address == ptr) {
+            slot = i;
+            break;
+        }
+    }
+
+    /* Ignore unknown and interior pointers. */
+    if (slot == HEAP_MAX_ALLOCS) {
+        return;
+    }
+
+    uint64_t first = allocations[slot].first_page;
+    uint64_t count = allocations[slot].page_count;
+
+    /* Validate allocation metadata. */
+    if (count == 0 ||
+        first >= HEAP_MAX_PAGES ||
+        count > HEAP_MAX_PAGES - first) {
+        return;
+    }
+
+    uint64_t physical_frames[HEAP_MAX_PAGES];
+
+    /*
+     * Phase 1:
+     * Validate every page before changing any mapping.
+     */
+    for (uint64_t i = 0; i < count; i++) {
+        if (!page_used[first + i]) {
+            return;
+        }
+
+        uint64_t address =
+            HEAP_START + (first + i) * HEAP_PAGE_SIZE;
+
+        uint64_t physical = 0;
+
+        if (!vmm_translate(
+                address,
+                heap_hhdm_offset,
+                &physical)) {
+            return;
+        }
+
+        if (physical == 0 ||
+            physical % HEAP_PAGE_SIZE != 0) {
+            return;
+        }
+
+        physical_frames[i] = physical;
+    }
+
+    /*
+     * Phase 2:
+     * Unmap every page.
+     * If an unmap fails, restore removed mappings.
+     */
+    uint64_t unmapped = 0;
+
+    while (unmapped < count) {
+        uint64_t address =
+            HEAP_START +
+            (first + unmapped) * HEAP_PAGE_SIZE;
+
+        uint64_t physical = 0;
+
+        if (!vmm_unmap_page(
+                address,
+                heap_hhdm_offset,
+                &physical)) {
+            break;
+        }
+
+        /*
+         * Count the page immediately after successful unmapping.
+         */
+        unmapped++;
+
+        if (physical != physical_frames[unmapped - 1]) {
+            break;
+        }
+    }
+
+    if (unmapped != count) {
+        /* Restore every page that was successfully unmapped. */
+        while (unmapped > 0) {
+            unmapped--;
+
+            uint64_t address =
+                HEAP_START +
+                (first + unmapped) * HEAP_PAGE_SIZE;
+
+            vmm_map_page_flags(
+                address,
+                physical_frames[unmapped],
+                heap_hhdm_offset,
+                HEAP_FLAGS);
+        }
+
+        return;
+    }
+
+    /*
+     * Phase 3:
+     * Return physical frames to the PMM.
+     */
+    for (uint64_t i = 0; i < count; i++) {
+        if (!pmm_free_frame(physical_frames[i])) {
+            /*
+             * Indicates an allocator consistency error.
+             * Do not reuse allocation metadata.
+             */
+            return;
+        }
+    }
+
+    /* Phase 4: Release heap metadata. */
+    for (uint64_t i = 0; i < count; i++) {
+        page_used[first + i] = false;
+    }
+
+    allocations[slot].address = NULL;
+    allocations[slot].first_page = 0;
+    allocations[slot].page_count = 0;
+    allocations[slot].used = false;
+}
