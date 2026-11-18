@@ -1,0 +1,292 @@
+
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+
+#include "idt.h"
+#include "serial.h"
+
+#define IDT_ENTRIES 256
+#define IDT_INTERRUPT_GATE 0x8E
+
+#define PAGE_FAULT_VECTOR 14
+
+struct idt_entry {
+    uint16_t offset_low;
+    uint16_t selector;
+    uint8_t ist;
+    uint8_t attributes;
+    uint16_t offset_middle;
+    uint32_t offset_high;
+    uint32_t reserved;
+} __attribute__((packed));
+
+struct idt_pointer {
+    uint16_t limit;
+    uint64_t base;
+} __attribute__((packed));
+
+extern void *isr_stub_table[32];
+
+static struct idt_entry idt[IDT_ENTRIES];
+
+static bool idt_initialized = false;
+
+/* Expected page-fault information */
+static volatile bool expected_fault_armed = false;
+static uint64_t expected_fault_address = 0;
+static uint64_t expected_error_mask = 0;
+static uint64_t expected_error_value = 0;
+static uintptr_t expected_recovery_address = 0;
+
+static void idt_set_gate(uint8_t vector, void (*handler)(void))
+{
+    uint64_t address = (uint64_t)(uintptr_t)handler;
+
+    idt[vector].offset_low = (uint16_t)(address & 0xFFFF);
+
+    uint16_t code_segment;
+
+    __asm__ volatile (
+        "mov %%cs, %0"
+        : "=r"(code_segment)
+    );
+
+    idt[vector].selector = code_segment;
+    idt[vector].ist = 0;
+    idt[vector].attributes = IDT_INTERRUPT_GATE;
+
+    idt[vector].offset_middle =
+        (uint16_t)((address >> 16) & 0xFFFF);
+
+    idt[vector].offset_high = (uint32_t)(address >> 32);
+    idt[vector].reserved = 0;
+}
+
+static void load_idt(const struct idt_pointer *pointer)
+{
+    __asm__ volatile (
+        "lidt (%0)"
+        :
+        : "r"(pointer)
+        : "memory"
+    );
+}
+
+static void serial_write_hex64(uint64_t value)
+{
+    static const char digits[] = "0123456789ABCDEF";
+
+    serial_writestring("0x");
+
+    for (int shift = 60; shift >= 0; shift -= 4) {
+        serial_write_char(digits[(value >> shift) & 0xF]);
+    }
+}
+
+static const char *exception_name(uint64_t vector)
+{
+    switch (vector) {
+        case 0:  return "Divide Error";
+        case 1:  return "Debug";
+        case 2:  return "Non-Maskable Interrupt";
+        case 3:  return "Breakpoint";
+        case 4:  return "Overflow";
+        case 5:  return "Bound Range";
+        case 6:  return "Invalid Opcode";
+        case 7:  return "Device Not Available";
+        case 8:  return "Double Fault";
+        case 10: return "Invalid TSS";
+        case 11: return "Segment Not Present";
+        case 12: return "Stack-Segment Fault";
+        case 13: return "General Protection Fault";
+        case 14: return "Page Fault";
+        case 16: return "x87 Floating-Point Exception";
+        case 17: return "Alignment Check";
+        case 18: return "Machine Check";
+        case 19: return "SIMD Floating-Point Exception";
+        case 20: return "Virtualization Exception";
+        case 21: return "Control Protection Exception";
+        case 28: return "Hypervisor Injection Exception";
+        case 29: return "VMM Communication Exception";
+        case 30: return "Security Exception";
+        default: return "Unknown Exception";
+    }
+}
+
+bool idt_expect_page_fault(
+    uint64_t fault_address,
+    uint64_t error_mask,
+    uint64_t error_value,
+    uintptr_t recovery_address)
+{
+    if (!idt_initialized || recovery_address == 0) {
+        return false;
+    }
+
+    if ((error_value & ~error_mask) != 0) {
+        return false;
+    }
+
+    if (expected_fault_armed) {
+        return false;
+    }
+
+    expected_fault_address = fault_address;
+    expected_error_mask = error_mask;
+    expected_error_value = error_value;
+    expected_recovery_address = recovery_address;
+
+    expected_fault_armed = true;
+
+    return true;
+}
+
+void idt_cancel_expected_page_fault(void)
+{
+    expected_fault_armed = false;
+
+    expected_fault_address = 0;
+    expected_error_mask = 0;
+    expected_error_value = 0;
+    expected_recovery_address = 0;
+}
+
+void isr_handler(uint64_t *stack_frame)
+{
+    uint64_t vector = stack_frame[15];
+    uint64_t error_code = stack_frame[16];
+
+    /*
+     * Handle an expected page fault.
+     */
+    if (vector == PAGE_FAULT_VECTOR && expected_fault_armed) {
+
+        uint64_t fault_address;
+
+        __asm__ volatile (
+            "mov %%cr2, %0"
+            : "=r"(fault_address)
+        );
+
+        if (fault_address == expected_fault_address &&
+            (error_code & expected_error_mask) ==
+                expected_error_value) {
+
+            uintptr_t recovery = expected_recovery_address;
+
+            idt_cancel_expected_page_fault();
+
+            /* Redirect execution to the recovery address. */
+            stack_frame[17] = (uint64_t)recovery;
+
+            serial_writestring(
+                "\n[IDT] Expected page fault recovered\n"
+            );
+
+            return;
+        }
+    }
+
+    /*
+     * Unexpected exception.
+     * Clear any pending expected-fault information.
+     */
+    if (expected_fault_armed) {
+        idt_cancel_expected_page_fault();
+    }
+
+    serial_writestring("\n[IDT] CPU exception: ");
+    serial_writestring(exception_name(vector));
+
+    serial_writestring("\n[IDT] Vector = ");
+    serial_write_hex64(vector);
+
+    serial_writestring("\n[IDT] Error code = ");
+    serial_write_hex64(error_code);
+
+    if (vector == PAGE_FAULT_VECTOR) {
+
+        uint64_t fault_address;
+
+        __asm__ volatile (
+            "mov %%cr2, %0"
+            : "=r"(fault_address)
+        );
+
+        serial_writestring("\n[IDT] Faulting address = ");
+        serial_write_hex64(fault_address);
+
+        serial_writestring("\n[IDT] Page-fault error code = ");
+        serial_write_hex64(error_code);
+
+        if (error_code & (1ULL << 0)) {
+            serial_writestring(
+                "\n[IDT] Cause: protection violation"
+            );
+        } else {
+            serial_writestring(
+                "\n[IDT] Cause: page not present"
+            );
+        }
+
+        if (error_code & (1ULL << 1)) {
+            serial_writestring("\n[IDT] Access: write");
+        } else {
+            serial_writestring(
+                "\n[IDT] Access: read or instruction fetch"
+            );
+        }
+
+        if (error_code & (1ULL << 2)) {
+            serial_writestring("\n[IDT] Access: user mode");
+        } else {
+            serial_writestring("\n[IDT] Access: supervisor mode");
+        }
+
+        if (error_code & (1ULL << 4)) {
+            serial_writestring(
+                "\n[IDT] Cause: instruction fetch"
+            );
+        }
+    }
+
+    serial_writestring("\n[IDT] System halted\n");
+
+    for (;;) {
+        __asm__ volatile ("cli; hlt");
+    }
+}
+
+bool idt_init(void)
+{
+    /* Prevent repeated IDT initialization. */
+    if (idt_initialized) {
+        return false;
+    }
+
+    for (uint64_t i = 0; i < IDT_ENTRIES; i++) {
+        idt[i] = (struct idt_entry){0};
+    }
+
+    /* Install exception handlers for vectors 0-31. */
+    for (uint8_t i = 0; i < 32; i++) {
+        idt_set_gate(i, (void (*)(void))isr_stub_table[i]);
+    }
+
+    struct idt_pointer pointer = {
+        .limit = sizeof(idt) - 1,
+        .base = (uint64_t)(uintptr_t)idt
+    };
+
+    /* Load the Interrupt Descriptor Table. */
+    load_idt(&pointer);
+
+    idt_initialized = true;
+
+    serial_writestring(
+        "[IDT] Interrupt Descriptor Table loaded\n"
+    );
+
+    return true;
+}
